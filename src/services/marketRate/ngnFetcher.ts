@@ -1,132 +1,262 @@
 import axios from "axios";
-import {
-  MarketRateFetcher,
-  MarketRate,
-  calculateMedian,
-} from "./types";
+import { MarketRateFetcher, MarketRate, calculateMedian } from "./types";
 
-/**
- * Binance P2P Response Interface
- */
-interface BinanceP2PResponse {
-  data?: Array<{
-    adv?: {
-      price: string;
-      asset: string;
-      fiatUnit: string;
-    };
-  }>;
-  success?: boolean;
-}
+type CoinGeckoPriceResponse = {
+  stellar?: {
+    ngn?: number;
+    usd?: number;
+    last_updated_at?: number;
+  };
+};
 
-/**
- * ExchangeRate API Response
- */
-interface ExchangeRateApiResponse {
+type ExchangeRateApiResponse = {
   result?: string;
   rates?: {
     NGN?: number;
   };
   time_last_update_unix?: number;
+};
+
+type VtpassVariation = {
+  variation_code: string;
+  name: string;
+  variation_amount: string;
+  variation_rate?: string;
+  fixedPrice?: string;
+};
+
+type VtpassVariationsResponse = {
+  response_description: string;
+  content?: {
+    variations?: VtpassVariation[];
+  };
+};
+
+function parseAmount(value: string | undefined): number | null {
+  if (value == null) return null;
+  const n = Number.parseFloat(String(value).replace(/,/g, ""));
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return n;
 }
 
+/**
+ * NGN/XLM rate fetcher.
+ *
+ * Primary path uses VTpass {@link https://www.vtpass.com/documentation/variation-codes/ service-variations}
+ * to read a configured variation's `variation_amount` as the Naira price for one unit of the underlying
+ * SKU (configure a 1 USD/BUSD reference variation so `variation_amount` ≈ NGN per USD). That value is
+ * multiplied by CoinGecko XLM/USD for NGN per XLM.
+ *
+ * Falls back to CoinGecko XLM/NGN directly, then XLM/USD × USD→NGN (open.er-api), matching other fetchers.
+ */
 export class NGNRateFetcher implements MarketRateFetcher {
-  private readonly binanceP2PUrl = "https://p2p-api.binance.com/bapi/c2c/v2/public/c2c/adv/search";
-  private readonly globalFxUrl = "https://open.er-api.com/v6/latest/USD";
-  private readonly CROSS_CHECK_THRESHOLD = 0.15; // 15% threshold for divergence
+  private readonly coinGeckoUrl =
+    "https://api.coingecko.com/api/v3/simple/price?ids=stellar&vs_currencies=ngn,usd&include_last_updated_at=true";
+
+  private readonly usdToNgnUrl = "https://open.er-api.com/v6/latest/USD";
+
+  private vtpassBase(): string {
+    return (
+      process.env.VTPASS_API_BASE_URL ?? "https://vtpass.com/api"
+    ).replace(/\/$/, "");
+  }
+
+  private vtpassHeaders(): Record<string, string> | undefined {
+    const apiKey = process.env.VTPASS_API_KEY;
+    const publicKey = process.env.VTPASS_PUBLIC_KEY;
+    if (apiKey && publicKey) {
+      return {
+        "api-key": apiKey,
+        "public-key": publicKey,
+      };
+    }
+    return undefined;
+  }
 
   getCurrency(): string {
     return "NGN";
   }
 
+  private async fetchNgnPerUsdFromVtpass(): Promise<{
+    ngnPerUsd: number;
+    timestamp: Date;
+  } | null> {
+    const serviceId = process.env.VTPASS_NGN_SERVICE_ID?.trim();
+    const variationCode = process.env.VTPASS_NGN_VARIATION_CODE?.trim();
+    if (!serviceId || !variationCode) return null;
+
+    const headers = this.vtpassHeaders();
+    if (!headers) return null;
+
+    const response = await axios.get<VtpassVariationsResponse>(
+      `${this.vtpassBase()}/service-variations`,
+      {
+        params: { serviceID: serviceId },
+        timeout: 15000,
+        headers: {
+          ...headers,
+          "User-Agent": "StellarFlow-Oracle/1.0",
+        },
+      },
+    );
+
+    if (response.data.response_description !== "000") {
+      return null;
+    }
+
+    const variations = response.data.content?.variations ?? [];
+    const match = variations.find(
+      (v) => v.variation_code === variationCode,
+    );
+    if (!match) return null;
+
+    const rateFromField = parseAmount(match.variation_rate);
+    const amount = parseAmount(match.variation_amount);
+    const ngnPerUsd = rateFromField ?? amount;
+    if (ngnPerUsd == null) return null;
+
+    return { ngnPerUsd, timestamp: new Date() };
+  }
+
   async fetchRate(): Promise<MarketRate> {
     const prices: { rate: number; timestamp: Date; source: string }[] = [];
-    let primaryRate: number | null = null;
-    let secondaryRate: number | null = null;
 
-    // 1. Fetch from Binance P2P (Representing "Local" Market Data)
+    // Strategy 1: VTpass NGN-per-USD (variation) × CoinGecko XLM/USD
     try {
-      const response = await axios.post<BinanceP2PResponse>(
-        this.binanceP2PUrl,
-        {
-          fiat: "NGN",
-          asset: "USDT",
-          merchantCheck: false,
-          rows: 5,
-          page: 1,
-          tradeType: "BUY",
-        },
-        { timeout: 10000 }
-      );
+      const vt = await this.fetchNgnPerUsdFromVtpass();
+      if (vt) {
+        const coinGeckoResponse = await axios.get<CoinGeckoPriceResponse>(
+          this.coinGeckoUrl,
+          {
+            timeout: 10000,
+            headers: {
+              "User-Agent": "StellarFlow-Oracle/1.0",
+            },
+          },
+        );
 
-      if (response.data?.data && response.data.data.length > 0) {
-        const rates = response.data.data
-          .map((item) => item.adv?.price)
-          .filter((price): price is string => !!price)
-          .map((price) => parseFloat(price))
-          .filter((price) => !isNaN(price) && price > 0);
-
-        if (rates.length > 0) {
-          primaryRate = rates.reduce((a, b) => a + b, 0) / rates.length;
+        const usd = coinGeckoResponse.data.stellar?.usd;
+        if (typeof usd === "number" && usd > 0) {
+          const lastUpdatedAt = coinGeckoResponse.data.stellar?.last_updated_at
+            ? new Date(
+                coinGeckoResponse.data.stellar.last_updated_at * 1000,
+              )
+            : new Date();
+          const ts =
+            vt.timestamp > lastUpdatedAt ? vt.timestamp : lastUpdatedAt;
           prices.push({
-            rate: primaryRate,
-            timestamp: new Date(),
-            source: "Binance P2P (Local Market)",
+            rate: usd * vt.ngnPerUsd,
+            timestamp: ts,
+            source: "VTpass variation + CoinGecko (XLM/USD)",
           });
         }
       }
-    } catch (error) {
-      console.warn("NGN Fetcher: Binance P2P failed", error instanceof Error ? error.message : error);
+    } catch {
+      console.debug("VTpass + CoinGecko XLM/USD failed");
     }
 
-    // 2. Fetch from Global FX API (Representing "Secondary Global Source")
+    // Strategy 2: CoinGecko direct XLM/NGN
     try {
-      const response = await axios.get<ExchangeRateApiResponse>(this.globalFxUrl, { timeout: 10000 });
-      if (response.data?.result === "success" && response.data.rates?.NGN) {
-        secondaryRate = response.data.rates.NGN;
-        const timestamp = response.data.time_last_update_unix 
-          ? new Date(response.data.time_last_update_unix * 1000) 
+      const coinGeckoResponse = await axios.get<CoinGeckoPriceResponse>(
+        this.coinGeckoUrl,
+        {
+          timeout: 10000,
+          headers: {
+            "User-Agent": "StellarFlow-Oracle/1.0",
+          },
+        },
+      );
+
+      const stellarPrice = coinGeckoResponse.data.stellar;
+      if (
+        stellarPrice &&
+        typeof stellarPrice.ngn === "number" &&
+        stellarPrice.ngn > 0
+      ) {
+        const lastUpdatedAt = stellarPrice.last_updated_at
+          ? new Date(stellarPrice.last_updated_at * 1000)
           : new Date();
-          
+
         prices.push({
-          rate: secondaryRate,
-          timestamp,
-          source: "Global FX API (Secondary/Official)",
+          rate: stellarPrice.ngn,
+          timestamp: lastUpdatedAt,
+          source: "CoinGecko (direct NGN)",
         });
       }
-    } catch (error) {
-      console.warn("NGN Fetcher: Global FX API failed", error instanceof Error ? error.message : error);
+    } catch {
+      console.debug("CoinGecko direct NGN failed");
     }
 
-    // 3. Cross-Check and Verification
-    if (primaryRate && secondaryRate) {
-      const divergence = Math.abs(primaryRate - secondaryRate) / secondaryRate;
-      if (divergence > this.CROSS_CHECK_THRESHOLD) {
-        console.warn(
-          `⚠️ NGN Rate Cross-Check Alert: Significant divergence detected! ` +
-          `Local (P2P): ${primaryRate.toFixed(2)}, Global: ${secondaryRate.toFixed(2)}. ` +
-          `Divergence: ${(divergence * 100).toFixed(2)}%`
+    // Strategy 3: CoinGecko XLM/USD × USD/NGN (open.er-api)
+    try {
+      const coinGeckoResponse = await axios.get<CoinGeckoPriceResponse>(
+        this.coinGeckoUrl,
+        {
+          timeout: 10000,
+          headers: {
+            "User-Agent": "StellarFlow-Oracle/1.0",
+          },
+        },
+      );
+
+      const stellarPrice = coinGeckoResponse.data.stellar;
+      if (
+        stellarPrice &&
+        typeof stellarPrice.usd === "number" &&
+        stellarPrice.usd > 0
+      ) {
+        const fxResponse = await axios.get<ExchangeRateApiResponse>(
+          this.usdToNgnUrl,
+          {
+            timeout: 10000,
+            headers: {
+              "User-Agent": "StellarFlow-Oracle/1.0",
+            },
+          },
         );
-      } else {
-        console.info(`✅ NGN Rate Cross-Check passed. Divergence: ${(divergence * 100).toFixed(2)}%`);
+
+        const usdToNgn = fxResponse.data.rates?.NGN;
+        if (
+          fxResponse.data.result === "success" &&
+          typeof usdToNgn === "number" &&
+          usdToNgn > 0
+        ) {
+          const fxTimestamp = fxResponse.data.time_last_update_unix
+            ? new Date(fxResponse.data.time_last_update_unix * 1000)
+            : new Date();
+          const lastUpdatedAt = stellarPrice.last_updated_at
+            ? new Date(stellarPrice.last_updated_at * 1000)
+            : new Date();
+
+          prices.push({
+            rate: stellarPrice.usd * usdToNgn,
+            timestamp:
+              fxTimestamp > lastUpdatedAt ? fxTimestamp : lastUpdatedAt,
+            source: "CoinGecko + ExchangeRate API (USD→NGN)",
+          });
+        }
       }
+    } catch {
+      console.debug("CoinGecko + ExchangeRate API (NGN) failed");
     }
 
-    if (prices.length === 0) {
-      throw new Error("Failed to fetch NGN rate from all sources");
+    if (prices.length > 0) {
+      const rateValues = prices.map((p) => p.rate);
+      const medianRate = calculateMedian(rateValues);
+      const mostRecentTimestamp = prices.reduce(
+        (latest, p) => (p.timestamp > latest ? p.timestamp : latest),
+        prices[0]?.timestamp ?? new Date(),
+      );
+
+      return {
+        currency: "NGN",
+        rate: medianRate,
+        timestamp: mostRecentTimestamp,
+        source: `Median of ${prices.length} sources`,
+      };
     }
 
-    // Prefer primary market rate if available, otherwise use secondary
-    const finalRate = primaryRate || secondaryRate || 0;
-    const finalSource = primaryRate ? "Binance P2P (Cross-checked)" : "Global FX API";
-    const finalTimestamp = prices.find(p => p.rate === finalRate)?.timestamp ?? new Date();
-
-    return {
-      currency: "NGN",
-      rate: finalRate,
-      timestamp: finalTimestamp,
-      source: finalSource,
-    };
+    throw new Error("All NGN rate sources failed");
   }
 
   async isHealthy(): Promise<boolean> {

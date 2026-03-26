@@ -1,102 +1,88 @@
-import assert from 'node:assert/strict';
-import axios from 'axios';
-import { NGNRateFetcher } from '../src/services/marketRate/ngnFetcher';
+import assert from "node:assert/strict";
+import axios from "axios";
+import { NGNRateFetcher } from "../src/services/marketRate/ngnFetcher";
 
 async function run() {
-  const originalPost = axios.post;
   const originalGet = axios.get;
+  const savedEnv = {
+    VTPASS_API_KEY: process.env.VTPASS_API_KEY,
+    VTPASS_PUBLIC_KEY: process.env.VTPASS_PUBLIC_KEY,
+    VTPASS_NGN_SERVICE_ID: process.env.VTPASS_NGN_SERVICE_ID,
+    VTPASS_NGN_VARIATION_CODE: process.env.VTPASS_NGN_VARIATION_CODE,
+  };
 
   try {
+    process.env.VTPASS_API_KEY = "test-key";
+    process.env.VTPASS_PUBLIC_KEY = "PK_test";
+    process.env.VTPASS_NGN_SERVICE_ID = "test-service";
+    process.env.VTPASS_NGN_VARIATION_CODE = "ref-usd";
+
     const fetcher = new NGNRateFetcher();
 
-    // Test Case 1: Normal operation where both sources are close
-    console.log('🧪 Test Case 1: Normal operation (sources are close)');
-    axios.post = (async (url: string) => {
-      if (url.includes('binance.com')) {
-        return {
-          data: {
-            success: true,
-            data: [{ adv: { price: '1500.00' } }, { adv: { price: '1500.00' } }]
-          }
-        };
-      }
-      throw new Error(`Unexpected URL: ${url}`);
-    }) as typeof axios.post;
-
     axios.get = (async (url: string) => {
-      if (url.includes('open.er-api.com')) {
+      if (url.includes("service-variations")) {
         return {
           data: {
-            result: 'success',
-            rates: { NGN: 1450.00 },
-            time_last_update_unix: Date.now() / 1000
-          }
+            response_description: "000",
+            content: {
+              variations: [
+                {
+                  variation_code: "ref-usd",
+                  name: "1 USD reference",
+                  variation_amount: "1500.00",
+                  fixedPrice: "Yes",
+                },
+              ],
+            },
+          },
         };
       }
+
+      if (url.includes("api.coingecko.com")) {
+        return {
+          data: {
+            stellar: {
+              ngn: 300,
+              usd: 0.2,
+              last_updated_at: 1_774_464_561,
+            },
+          },
+        };
+      }
+
+      if (url.includes("open.er-api.com")) {
+        return {
+          data: {
+            result: "success",
+            rates: {
+              NGN: 7500,
+            },
+            time_last_update_unix: 1_774_396_951,
+          },
+        };
+      }
+
       throw new Error(`Unexpected URL: ${url}`);
     }) as typeof axios.get;
 
     const rate = await fetcher.fetchRate();
-    assert.equal(rate.currency, 'NGN');
-    assert.equal(rate.rate, 1500.00);
-    assert.equal(rate.source, 'Binance P2P (Cross-checked)');
-    console.log('✅ Test Case 1 passed');
-
-    // Test Case 2: Divergence exceeding threshold
-    console.log('\n🧪 Test Case 2: Significant divergence');
-    axios.get = (async (url: string) => {
-      if (url.includes('open.er-api.com')) {
-        return {
-          data: {
-            result: 'success',
-            rates: { NGN: 1200.00 }, // Big gap: (1500-1200)/1200 = 25% > 15%
-            time_last_update_unix: Date.now() / 1000
-          }
-        };
-      }
-      throw new Error(`Unexpected URL: ${url}`);
-    }) as typeof axios.get;
-
-    const divergentRate = await fetcher.fetchRate();
-    assert.equal(divergentRate.rate, 1500.00); 
-    console.log('✅ Test Case 2 (Check logs for warning)');
-
-    // Test Case 3: Only primary source works
-    console.log('\n🧪 Test Case 3: Only primary source works');
-    axios.get = (async () => { throw new Error('Global API Down'); }) as typeof axios.get;
-    const primaryOnlyRate = await fetcher.fetchRate();
-    assert.equal(primaryOnlyRate.rate, 1500.00);
-    assert.equal(primaryOnlyRate.source, 'Binance P2P (Cross-checked)');
-    console.log('✅ Test Case 3 passed');
-
-    // Test Case 4: Only secondary source works
-    console.log('\n🧪 Test Case 4: Only secondary source works');
-    axios.post = (async () => { throw new Error('Binance P2P Down'); }) as typeof axios.post;
-    axios.get = (async (url: string) => {
-      if (url.includes('open.er-api.com')) {
-        return {
-          data: {
-            result: 'success',
-            rates: { NGN: 1450.00 },
-            time_last_update_unix: Date.now() / 1000
-          }
-        };
-      }
-      throw new Error(`Unexpected URL: ${url}`);
-    }) as typeof axios.get;
-
-    const secondaryOnlyRate = await fetcher.fetchRate();
-    assert.equal(secondaryOnlyRate.rate, 1450.00);
-    assert.equal(secondaryOnlyRate.source, 'Global FX API');
-    console.log('✅ Test Case 4 passed');
-
+    assert.equal(rate.currency, "NGN");
+    // VTpass path: 1500 * 0.2 = 300; CoinGecko NGN: 300; FX path: 0.2 * 7500 = 1500 → median 300
+    assert.equal(rate.rate, 300);
+    assert.match(rate.source, /^Median of \d+ sources$/);
   } finally {
-    axios.post = originalPost;
     axios.get = originalGet;
+    for (const [key, val] of Object.entries(savedEnv)) {
+      if (val === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = val;
+      }
+    }
   }
 }
 
 run().catch((error) => {
-  console.error('❌ Test failed:', error);
-  process.exit(1);
+  console.error(error);
+  process.exitCode = 1;
 });
